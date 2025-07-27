@@ -1,0 +1,236 @@
+import cv2
+import serial
+import time
+import torch
+import numpy as np
+import math
+import matplotlib.path as mpltPath
+from ultralytics import YOLO
+from shapely.geometry import Polygon, box
+
+# Initialize video capture
+cap = cv2.VideoCapture("input_videos/v8.mp4")
+
+#ap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+#cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+frame_size = (1920,1080
+              )
+
+frame_poly = box(0, 0, frame_size[0], frame_size[1])
+img = np.ones((frame_size[1], frame_size[0], 3), dtype=np.uint8) * 255
+
+# Configure the serial port
+PORT = 'COM14'  # Replace with your Arduino's serial port
+BAUD_RATE = 9600
+
+# Serial port initialization
+try:
+    ser = serial.Serial(PORT, BAUD_RATE, timeout=1)  # Added timeout
+    time.sleep(2)  # Give the serial port time to initialize
+    print(f"Connected to serial port {PORT}")
+except serial.SerialException as e:
+    print(f"Error: Could not connect to serial port {PORT}: {e}")
+    ser = None
+
+def draw_polygon(img, polygon, color, thickness=2):
+    if polygon.geom_type == "Polygon":
+        contours = [np.array(polygon.exterior.coords, dtype=np.int32)]
+    elif polygon.geom_type == "MultiPolygon":
+        contours = [np.array(poly.exterior.coords, dtype=np.int32) for poly in polygon.geoms]
+    else:
+        return
+
+    cv2.polylines(img, contours, isClosed=True, color=color, thickness=thickness)
+
+def send_score(score):
+    global ser
+    if ser:
+        try:
+            ser.write(f"{score}\n".encode('utf-8'))
+            print(f"Sent score: {score} to Arduino")
+        except serial.SerialException as e:
+            print(f"Error sending score: {e}")
+
+fps = cap.get(cv2.CAP_PROP_FPS)
+
+# Load the YOLO model with GPU support
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+model = YOLO("models/FINAL/final v2.pt").to(device)
+
+prev_centr = None
+speed = 0
+points = []
+polygon_points = []
+net_points = []
+p1 = 0
+p2 = 0 
+score = "0000"
+k = 1
+frame_count = 0
+c = False
+
+def is_point_in_quadrilateral(point, quad):
+    path = mpltPath.Path(quad)
+    return path.contains_point(point)
+
+def mouse_callback(event, x, y, flags, param):
+    global polygon_points, first_frame
+    if event == cv2.EVENT_LBUTTONDOWN and len(polygon_points) < 6:
+        polygon_points.append((x, y))
+        cv2.circle(first_frame, (x, y), 2, (0, 255, 0), 2)
+        cv2.imshow("Select Points", first_frame)
+
+def mouse_callback1(event, x, y, flags, param):
+    global net_points, first_frame
+    if event == cv2.EVENT_LBUTTONDOWN and len(net_points) < 4:
+        net_points.append((x, y))
+        cv2.circle(first_frame, (x, y), 2, (0, 255, 0), -1)
+        cv2.imshow("Select Points", first_frame)
+
+# Read the first frame and select points
+i = 1
+while i < 3:
+    ret,  first_frame= cap.read()
+    cv2.namedWindow("Select Points", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Select Points",1920, 1080)
+    first_frame = cv2.resize(first_frame, (1920, 1080))
+    if not ret:
+        print("Failed to read the video")
+        cap.release()
+        break
+    cv2.imshow("Select Points", first_frame)
+    if i == 1:
+        cv2.setMouseCallback("Select Points", mouse_callback)
+        while len(polygon_points) < 6:
+            cv2.waitKey(1)
+    else:
+        cv2.setMouseCallback("Select Points", mouse_callback1)
+        while len(net_points) < 4:
+            cv2.waitKey(1)
+    i += 1
+
+cv2.destroyWindow("Select Points")
+cap = cv2.VideoCapture("input_videos/v8.mp4")
+cv2.namedWindow("Frame", cv2.WINDOW_NORMAL)
+cv2.resizeWindow("Frame", 1920, 1080) 
+while cap.isOpened():
+    ret, img = cap.read()
+    img = cv2.resize(img, (1920, 1080), interpolation=cv2.INTER_CUBIC)
+    if not ret:
+        break
+    
+    # Read serial input (non-blocking)
+    if ser and ser.in_waiting > 0:
+        line = ser.readline().decode('utf-8').strip()
+        if line == "BUTTON_PRESSED":
+            k = 0
+
+            c = False
+            print("Button Pressed! k set to 0.")
+
+    # Run the model on the current frame (GPU)
+    results = model(img)
+    net_pts = np.array([
+              [631, 403],
+              [1135, 424],
+              [1140, 371],
+              [629, 344]
+    ])
+    
+    for result in results:
+        for box_data in result.boxes:
+            x1, y1, x2, y2 = map(int, box_data.xyxy[0])
+            confidence = box_data.conf[0].item() 
+            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            Cx, Cy = (x1 + x2) / 2, (y1 + y2) / 2
+            cv2.circle(img, (int(Cx), int(Cy)), 5, (0, 0, 255), -1)
+            confidence_text = f"{confidence:.2f}"
+            cv2.putText(img, confidence_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+
+            if prev_centr is not None:
+                dx, dy = Cx - prev_centr[0], Cy - prev_centr[1]
+                distance = math.sqrt(dx**2 + dy**2)
+                speed = distance * fps
+                cv2.putText(img, f"Speed: {speed:.2f} m/s", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+                if 0 < speed < 18 and k == 0:
+                    k = 1
+                    c=True
+                    #if p1 ==11 or p2 == 11:
+                       #p1=0
+                       #p2=0
+                    NET = is_point_in_quadrilateral((Cx, Cy), net_pts)
+                    points.append((Cx, Cy))
+                    if is_point_in_quadrilateral((Cx, Cy), pts_tuple1):
+                        #p2 += 1
+                        score="2"
+                        print("OUT1")
+                    elif is_point_in_quadrilateral((Cx, Cy), pts_tuple2):
+                        #p1 += 1
+                        score="1"
+                        print("OUT2")
+                    elif is_point_in_quadrilateral((Cx, Cy), new_polygon_tuple) and not NET and (Cy < pts[2, 1] or Cy < pts[3, 1]):
+                        #p2 += 1
+                        score="2"
+                        print("OUT3")
+                    elif is_point_in_quadrilateral((Cx, Cy), new_polygon_tuple) and not NET and (Cy > pts[2, 1] or Cy > pts[3, 1]):
+                        #p1 += 1
+                        score="1"
+                        print("OUT4")
+                    else:
+                        score="0"
+                        print("NET")
+                    send_score(score)
+                    #score=str(p1) + str(p2)
+                    #print(score)
+                    
+
+
+            prev_centr = (Cx, Cy)
+    if c== True:
+            text_to_display = "OUT" if (is_point_in_quadrilateral((Cx, Cy), new_polygon_tuple)) else "In" if (is_point_in_quadrilateral((Cx, Cy), pts_tuple1)) else "IN" if (is_point_in_quadrilateral((Cx, Cy), pts_tuple2)) else "NET"
+            #cv2.putText(img, text_to_display, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)  # Place text at (10, 30)
+    for point in points:
+        cv2.circle(img, (int(point[0]), int(point[1])), 5, (255, 0, 0), -1)
+
+    frame_count += 1
+    #if frame_count % 30 == 0:
+        #send_score(score)
+        #if p1 == 11 or p2 == 11:
+                        #p1=0
+                        #p2=0
+
+    if len(polygon_points) == 6 and len(net_points) == 4:
+        pts1 = np.array(polygon_points, np.int32)
+        print(pts1)
+        net1= np.array(net_points, np.int32)
+        print(net1)
+        pts  = np.array([
+            [256, 624],
+            [1431, 656],
+            [1108, 482],
+            [651, 462],
+            [719, 437],
+            [1032, 444],
+        ])
+        first_half = pts[0:4, :]
+        second_half = pts[2:6, :]
+        pts_tuple1 = [tuple(pt) for pt in first_half]
+        pts_tuple2 = [tuple(pc) for pc in second_half]
+        new_polygon = frame_poly.difference(Polygon(pts_tuple1).union(Polygon(pts_tuple2)))
+        new_polygon_tuple = tuple(map(tuple, np.array(new_polygon.exterior.coords))) if new_polygon.geom_type == "Polygon" else [tuple(map(tuple, np.array(poly.exterior.coords))) for poly in new_polygon.geoms] if new_polygon.geom_type == "MultiPolygon" else None
+        cv2.polylines(img, [first_half.reshape((-1, 1, 2))], isClosed=True, color=(0, 0, 255), thickness=1)
+        cv2.polylines(img, [second_half.reshape((-1, 1, 2))], isClosed=True, color=(255, 0,0), thickness=1)
+        #cv2.polylines(img, [net_pts.reshape((-1, 1, 2))], isClosed=True, color=(0, 255, 0), thickness=1)
+        if new_polygon_tuple:
+            draw_polygon(img, new_polygon, (255, 0, 0), 2)
+ 
+
+    cv2.imshow("Frame", img)
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+cv2.destroyAllWindows()
+cap.release()
+if ser:
+    ser.close()
